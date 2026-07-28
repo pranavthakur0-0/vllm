@@ -27,6 +27,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 
+from .interfaces import SupportsPP
 from .qwen3_dflash import DFlashQwen3ForCausalLM, DFlashQwen3Model
 from .utils import AutoWeightsLoader, maybe_prefix, process_eagle_weight
 
@@ -67,7 +68,7 @@ class DSparkMarkovHead(nn.Module):
         return logits_processor(self.markov_w2, markov_embed)
 
 
-class Qwen3DSparkModel(DFlashQwen3Model):
+class Qwen3DSparkModel(DFlashQwen3Model, SupportsPP):
     """DFlash Qwen3 backbone + DSpark Markov head."""
 
     def __init__(

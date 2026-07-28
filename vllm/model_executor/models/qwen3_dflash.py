@@ -13,6 +13,7 @@ from vllm import _custom_ops as ops
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import (
+    get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
@@ -35,6 +36,7 @@ from vllm.multimodal.inputs import NestedTensors
 from vllm.transformers_utils.config import set_default_rope_theta
 from vllm.transformers_utils.repo_utils import get_hf_file_bytes
 from vllm.v1.attention.backend import AttentionType
+from vllm.sequence import IntermediateTensors
 from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
     get_eagle3_aux_layers_from_config,
 )
@@ -43,8 +45,10 @@ from .qwen2 import Qwen2MLP as Qwen3MLP
 from .qwen3 import Qwen3ForCausalLM
 from .utils import (
     AutoWeightsLoader,
+    PPMissingLayer,
     WeightsMapper,
     get_draft_quant_config,
+    make_empty_intermediate_tensors_factory,
     maybe_prefix,
     process_eagle_weight,
 )
@@ -424,10 +428,22 @@ class DFlashQwen3Model(nn.Module):
             self.config.hidden_size,
             eps=self.config.rms_norm_eps,
         )
-        self.norm = RMSNorm(
-            self.config.hidden_size,
-            eps=self.config.rms_norm_eps,
+        # PP splits the model across pipeline stages. On non-last ranks we
+        # stop before the final norm and return IntermediateTensors to be
+        # sent to the next pipeline stage.
+        self.make_empty_intermediate_tensors = (
+            make_empty_intermediate_tensors_factory(
+                ["hidden_states", "residual"],
+                self.config.hidden_size,
+            )
         )
+        if get_pp_group().is_last_rank:
+            self.norm = RMSNorm(
+                self.config.hidden_size,
+                eps=self.config.rms_norm_eps,
+            )
+        else:
+            self.norm = PPMissingLayer()
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         embeds = self.embed_tokens(input_ids)
@@ -620,22 +636,46 @@ class DFlashQwen3Model(nn.Module):
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor | None,
         positions: torch.Tensor,
-        input_embeds: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        if input_embeds is None:
-            input_embeds = self.embed_input_ids(input_ids)
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor | IntermediateTensors:
+        # Backward-compatibility: older call sites may pass `inputs_embeds`
+        # as the 3rd positional argument (which would land in
+        # `intermediate_tensors` due to this signature).
+        if (
+            intermediate_tensors is not None
+            and inputs_embeds is None
+            and isinstance(intermediate_tensors, torch.Tensor)
+        ):
+            inputs_embeds = intermediate_tensors
+            intermediate_tensors = None
 
-        hidden_states = input_embeds
+        if get_pp_group().is_first_rank:
+            if inputs_embeds is not None:
+                hidden_states = inputs_embeds
+            else:
+                assert input_ids is not None
+                hidden_states = self.embed_input_ids(input_ids)
+            residual = None
+        else:
+            assert intermediate_tensors is not None
+            hidden_states = intermediate_tensors["hidden_states"]
+            residual = intermediate_tensors["residual"]
 
-        residual = None
         for layer in self.layers:
             hidden_states, residual = layer(
                 positions=positions,
                 hidden_states=hidden_states,
                 residual=residual,
             )
+
+        if not get_pp_group().is_last_rank:
+            return IntermediateTensors(
+                {"hidden_states": hidden_states, "residual": residual}
+            )
+
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
@@ -694,6 +734,11 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
             )
         else:
             self.draft_id_to_target_id = None
+        # PP needs these tensors when receiving tensors from the previous
+        # pipeline stage.
+        self.make_empty_intermediate_tensors = (
+            self.model.make_empty_intermediate_tensors
+        )
 
     def embed_input_ids(
         self,
@@ -705,11 +750,32 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor | None,
         positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        return self.model(input_ids, positions, inputs_embeds)
+    ) -> torch.Tensor | IntermediateTensors:
+        # Backward-compatibility with any positional callers that used
+        # the pre-PP signature (where the 3rd positional argument was
+        # interpreted as `inputs_embeds`).
+        if (
+            intermediate_tensors is not None
+            and inputs_embeds is None
+            and isinstance(intermediate_tensors, torch.Tensor)
+        ):
+            inputs_embeds = intermediate_tensors
+            intermediate_tensors = None
+
+        if intermediate_tensors is not None:
+            # When we receive tensors from the previous pipeline stage,
+            # embeddings are already represented inside intermediate_tensors.
+            inputs_embeds = None
+        return self.model(
+            input_ids=input_ids,
+            positions=positions,
+            intermediate_tensors=intermediate_tensors,
+            inputs_embeds=inputs_embeds,
+        )
 
     def get_draft_kv_cache_layer_names(self) -> list[str]:
         return [layer.self_attn.attn.layer_name for layer in self.model.layers]
